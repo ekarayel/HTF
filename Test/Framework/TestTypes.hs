@@ -199,6 +199,12 @@ data TestConfig
       , tc_filter :: TestFilter         -- ^ Filter for the tests to run.
       , tc_reporters :: [TestReporter]  -- ^ Test reporters to use.
       , tc_useColors :: Bool            -- ^ Whether to use colored output
+      , tc_historyFile :: FilePath      -- ^ Path to history file
+      , tc_history :: TestHistory       -- ^ History of previous test runs
+      , tc_sortByPrevTime :: Bool       -- ^ Sort ascending by previous execution times
+      , tc_failFast :: Bool             -- ^ Stop test run as soon as one test fails
+      , tc_maxSingleTestTime :: Maybe Milliseconds -- ^ Maximum time in milliseconds a single test is allowed to run (exceedence does not cause failure)
+      , tc_maxGlobalTestTime :: Maybe Milliseconds -- ^ Maximum time in milliseconds the whole test suite is allowed to run (exceedence does not cause failure)
       }
 
 instance Show TestConfig where
@@ -206,10 +212,14 @@ instance Show TestConfig where
         showParen (prec > 0) $
         showString "TestConfig { " .
         showString "tc_quiet=" . showsPrec 1 (tc_quiet tc) .
---        showString ", tc_threads=" . showsPrec 1 (tc_threads tc) .
+        showString ", tc_threads=" . showsPrec 1 (tc_threads tc) .
+        showString ", tc_shuffle=" . showsPrec 1 (tc_shuffle tc) .
         showString ", tc_output=" . showsPrec 1 (tc_output tc) .
+        showString ", tc_outputXml=" . showsPrec 1 (tc_outputXml tc) .
         showString ", tc_filter=<filter>" .
         showString ", tc_reporters=" . showsPrec 1 (tc_reporters tc) .
+        showString ", tc_useColors=" . showsPrec 1 (tc_useColors tc) .
+        showString ", tc_history=" . showsPrec 1 (tc_history tc) .
         showString " }"
 
 -- | A 'TestReporter' provides hooks to customize the output of HTF.

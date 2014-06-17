@@ -20,7 +20,7 @@
 module Test.Framework.ThreadPool (
 
     ThreadPoolEntry, ThreadPool(..), sequentialThreadPool, parallelThreadPool
-  , threadPoolTest
+  , threadPoolTest, threadPoolTestStop
 
 ) where
 
@@ -32,9 +32,14 @@ import Control.Concurrent
 -- for tests
 import System.Random
 
+data StopFlag
+    = DoStop
+    | DoNotStop
+      deriving (Eq, Show, Read)
+
 type ThreadPoolEntry m a b = ( m a        -- pre-action, must not throw exceptions
                              , a -> IO b  -- action
-                             , Either Ex.SomeException b -> m ()  -- post-action, must not throw exceptions
+                             , Either Ex.SomeException b -> m StopFlag  -- post-action, must not throw exceptions. If the result is True, the thread pool is terminated asap.
                              )
 
 data ThreadPool m a b
@@ -51,8 +56,12 @@ parallelThreadPool n =
 
 runSequentially :: MonadIO m => [ThreadPoolEntry m a b] -> m ()
 runSequentially entries =
-    mapM_ run entries
+    loop entries
     where
+      loop [] = return ()
+      loop (e:es) =
+          do b <- run e
+             if b == DoStop then return () else loop es
       run (pre, action, post) =
           do a <- pre
              b <- liftIO $ Ex.try (action a)
@@ -69,7 +78,7 @@ type NamedChan a = (String, Chan a)
 
 type ToWorker m b = NamedMVar (WorkItem m b)
 
-data WorkResult m b = WorkResult (m ()) (ToWorker m b)
+data WorkResult m b = WorkResult (m StopFlag) (ToWorker m b)
 
 instance Show (WorkResult m b) where
     show _ = "WorkResult"
@@ -91,9 +100,11 @@ runParallel n entries =
       loop fromWorker nWorkers [] =
           cleanup fromWorker nWorkers
       loop fromWorker nWorkers (x:xs) =
-          do toWorker <- waitForWorkerResult fromWorker
-             runEntry x toWorker
-             loop fromWorker nWorkers xs
+          do (toWorker, stop) <- waitForWorkerResult fromWorker
+             if stop == DoStop
+             then return ()
+             else do runEntry x toWorker
+                     loop fromWorker nWorkers xs
       cleanup :: FromWorker m b -> Int -> m ()
       -- n is the number of workers that will still write to fromWorker
       cleanup fromWorker n =
@@ -101,11 +112,11 @@ runParallel n entries =
              toWorker <- waitForWorkerResult fromWorker
              liftIO $ putNamedMVar toWorker Done
              when (n > 1) $ cleanup fromWorker (n - 1)
-      waitForWorkerResult :: FromWorker m b -> m (ToWorker m b)
+      waitForWorkerResult :: FromWorker m b -> m (ToWorker m b, Bool)
       waitForWorkerResult fromWorker =
           do WorkResult postAction toWorker <- liftIO $ readNamedChan fromWorker
-             postAction
-             return toWorker
+             b <- postAction
+             return (toWorker, b)
       runEntry :: ThreadPoolEntry m a b -> ToWorker m b -> m ()
       runEntry (pre, action, post) toWorker =
           do a <- pre
@@ -213,3 +224,31 @@ threadPoolTest (i, j) nEntries =
     mapM (runTestParallel nEntries) [i..j] `Ex.catch`
              (\(e::Ex.BlockedIndefinitelyOnMVar) ->
                   fail ("main-thread blocked " ++ show e))
+
+threadPoolTestStop =
+    do putStrLn ("Running test to see of STOP works")
+       (boxes, entries) <- mapM mkEntry [1.100]
+       runParallel numberOfThreads entries
+       debug ("Checking boxes...")
+       mapM_ (checkBox True) (take numberOfThreads boxes)
+       mapM_ (checkBox False) (drop numberOfThreads boxes)
+       putStrLn ("Test for STOP successful")
+    where
+      mkEntry i =
+          do mvar <- newEmptyNamedMVar ("box-" ++ show i)
+             let pre = return ()
+                 action () =
+                     do putNamedMVar mvar ()
+                        return ()
+                 post () = return (i == numberOfThreads)
+             return (mvar, (pre, action, post))
+      numberOfThreads = 10
+      checkBox res (name, box) =
+          do isEmpty <- isEmptyMvar box
+             case (res, isEmpty) of
+               (True, False) -> return ()
+               (False, True) -> return ()
+               (True, True) ->
+                   fail ("Box " ++ name ++ " is still empty")
+               (False, False) ->
+                   fail ("Box " ++ name ++ " not empty")

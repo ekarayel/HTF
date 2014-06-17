@@ -126,10 +126,11 @@ flattenTestSuite (AnonTestSuite ts) =
     let fts = concatMap flattenTest ts
     in map (\ft -> ft { ft_path = TestPathCompound Nothing (ft_path ft) }) fts
 
-mkFlatTestRunner :: FlatTest -> ThreadPoolEntry TR () (Maybe (Bool, String), Int)
-mkFlatTestRunner ft = (pre, action, post)
+mkFlatTestRunner :: TestConfig -> FlatTest -> ThreadPoolEntry TR () (Maybe (Bool, String), Int)
+mkFlatTestRunner tc ft = (pre, action, post)
     where
       pre = reportTestStart ft
+      -- FIXME: abort test of running longer than tc_max
       action _ = measure $ HU.performTestCase (wto_payload (ft_payload ft))
       post excOrResult =
           let (testResult, (mLoc, callers, msg, time)) =
@@ -164,25 +165,46 @@ mkFlatTestRunner ft = (pre, action, post)
                      , ft_payload = RunResult testResult mLoc callers msg time }
           in do modify (\s -> s { ts_results = rr : ts_results s })
                 reportTestResult rr
+                return (stopFlag testResult)
+      stopFlag result =
+          if not (tc_failFast tc)
+          then DoNotStop
+          else case result of
+                 Pass -> DoNotStop
+                 Pending -> DoNotStop
+                 Fail -> DoStop
+                 Error -> DoStop
 
-runAllFlatTests :: [FlatTest] -> TR ()
-runAllFlatTests tests =
+runAllFlatTests :: TestConfig -> [FlatTest] -> TR ()
+runAllFlatTests tc tests' =
     do reportGlobalStart tests
        tc <- ask
        case tc_threads tc of
          Nothing ->
-             let entries = map mkFlatTestRunner tests
+             let entries = map (mkFlatTestRunner tc) tests
              in tp_run sequentialThreadPool entries
          Just i ->
              let (ptests, stests) = List.partition (\t -> to_parallel (wto_options (ft_payload t))) tests
-                 pentries' = map mkFlatTestRunner ptests
-                 sentries = map mkFlatTestRunner stests
+                 pentries' = map (mkFlatTestRunner tc) ptests
+                 sentries = map (mkFlatTestRunner tc) stests
              in do tp <- parallelThreadPool i
                    pentries <- if tc_shuffle tc
                                then liftIO (shuffleIO pentries')
                                else return pentries'
                    tp_run tp pentries
                    tp_run sequentialThreadPool sentries
+    where
+      tests = sortTests tests'
+      sortTests ts =
+          if not (tc_sortByPrevTime tc)
+          then ts
+          else map snd $ List.sortBy compareTests (map (\t -> (T.pack (flatName t), t)) ts)
+      compareTests (t1, _) (t2, _) =
+          case (findHistoricTestResult t1 (tc_history tc), findHistoricTestResult t2 (tc_history tc)) of
+            (Just r1, Just r2) = compare (htr_timeMs r1) (htr_timeMs r2)
+            (Just _, Nothing) = GT
+            (Nothing, Just _) = LT
+            (Nothing, Nothing) = EQ
 
 -- | Run something testable using the 'Test.Framework.TestConfig.defaultCmdlineOptions'.
 runTest :: TestableHTF t => t              -- ^ Testable thing
@@ -253,7 +275,7 @@ runTestWithOptions' opts t =
 --
 -- A test is /successful/ if the test terminates and no assertion fails.
 -- A test is said to /fail/ if an assertion fails but no other error occur.
-runTestWithConfig :: TestableHTF t => TestConfig -> t -> IO ExitCode
+runTestWithConfig :: TestableHTF t => TestConfig -> t -> IO (ExitCode, TestHistory)
 runTestWithConfig tc t =
     do (printSummary, ecode) <- runTestWithConfig' tc t
        printSummary
@@ -262,11 +284,15 @@ runTestWithConfig tc t =
 -- | Runs something testable with the given 'TestConfig'. Does not
 -- print the overall test results but returns an 'IO' action for doing so.
 -- See 'runTestWithConfig' for a specification of the 'ExitCode' result.
-runTestWithConfig' :: TestableHTF t => TestConfig -> t -> IO (IO (), ExitCode)
+runTestWithConfig' :: TestableHTF t => TestConfig -> t -> IO (IO (), ExitCode, TestHistory)
 runTestWithConfig' tc t =
      do ((_, s, _), time) <-
             measure $
             runRWST (runAllFlatTests (filter (tc_filter tc) (flatten t))) tc initTestState
+        {- FIXME: report on
+           * how many tests where filtered (by name or by previos run time)
+           * which tests did not run (because of single test or global runtime constraints, or because of fail fast)
+         -}
         let results = reverse (ts_results s)
             passed = filter (\ft -> (rr_result . ft_payload) ft == Pass) results
             pending = filter (\ft -> (rr_result . ft_payload) ft == Pending) results
