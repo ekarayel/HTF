@@ -97,7 +97,7 @@ main =
                     exitWith (ExitFailure 1)
        input <- hGetContents hIn
        output <- transform hunitBackwardsCompat debug origInputFilename input `catch`
-                   (\ (e::SomeException) ->
+                   (\ (e::IOException) ->
                         do hPutStrLn stderr (progName ++
                                              ": unexpected exception: " ++
                                              show e)

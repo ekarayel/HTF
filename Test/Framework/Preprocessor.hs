@@ -35,11 +35,14 @@ import Language.Preprocessor.Cpphs ( runCpphs,
                                      CpphsOptions(..),
                                      BoolOptions(..),
                                      defaultCpphsOptions)
-import System.IO ( hPutStrLn, stderr )
 import Test.HUnit hiding (State)
 import Control.Monad.State.Strict
+import Control.Monad.Error
 import qualified Data.List as List
 import Data.Maybe
+import System.Directory
+import System.IO
+import System.Exit
 
 import Test.Framework.Location
 
@@ -141,7 +144,7 @@ data Definition = TestDef String Location String
 
 type Name = String
 
-type PMA a = State ModuleInfo a
+type PMA a = StateT ModuleInfo (Either String) a
 
 setModName :: String -> PMA ()
 setModName name =
@@ -164,24 +167,28 @@ setTestFrameworkImport :: String -> PMA ()
 setTestFrameworkImport name =
     modify $ \mi -> mi { mi_htfPrefix = name }
 
-poorManAnalyzeTokens :: [LocToken] -> ModuleInfo
+poorManAnalyzeTokens :: [LocToken] -> Either String ModuleInfo
 poorManAnalyzeTokens toks =
     -- show toks `trace`
-    let revRes =
-            execState (loop toks) $
-                      ModuleInfo { mi_htfPrefix = htfModule ++ "."
-                                 , mi_htfImports = []
-                                 , mi_defs = []
-                                 , mi_moduleName = Nothing }
-    in ModuleInfo { mi_htfPrefix = mi_htfPrefix revRes
-                  , mi_htfImports = reverse (mi_htfImports revRes)
-                  , mi_defs = reverse $ List.nubBy defEqByName (mi_defs revRes)
-                  , mi_moduleName = mi_moduleName revRes
-                  }
+    case execStateT (loop toks) $
+                    ModuleInfo { mi_htfPrefix = htfModule ++ "."
+                               , mi_htfImports = []
+                               , mi_defs = []
+                               , mi_moduleName = Nothing }
+    of
+      Left err -> Left err
+      Right revRes ->
+        Right $
+        ModuleInfo { mi_htfPrefix = mi_htfPrefix revRes
+                   , mi_htfImports = reverse (mi_htfImports revRes)
+                   , mi_defs = reverse $ List.nubBy defEqByName (mi_defs revRes)
+                   , mi_moduleName = mi_moduleName revRes
+                   }
     where
       defEqByName (TestDef n1 _ _) (TestDef n2 _ _) = n1 == n2
       defEqByName (PropDef n1 _ _) (PropDef n2 _ _) = n1 == n2
       defEqByName _ _ = False
+      loop :: [LocToken] -> PMA ()
       loop toks =
         case toks of
           (Reservedid, (_, "module")) : rest ->
@@ -222,6 +229,9 @@ poorManAnalyzeTokens toks =
                             in setTestFrameworkImport
                                    (if null prefix then prefix else prefix ++ ".")
                           loop rest2
+          (ErrorToken, (loc, s)) : _rest ->
+              lift $ throwError (l_file loc ++ ":" ++ show (l_line loc) ++ ":" ++ show (l_column loc) ++
+                                 ": lexical error: " ++ s)
           _ : rest -> loop rest
           [] -> return ()
       parseImport loc toks =
@@ -280,6 +290,8 @@ cleanupTokens toks =
 cleanupInputString :: String -> String
 cleanupInputString s =
     case s of
+      '\'':'\'':rest ->
+          cleanupInputString rest
       '\'':rest ->
           case characterLitRest rest of
             Just (restLit, rest') ->
@@ -290,7 +302,7 @@ cleanupInputString s =
           | isSpace c && isUpper x ->         -- TH type quote
               c:x:cleanupInputString rest
       c:'\'':x:rest                -- TH name quote
-          | isSpace c && isNothing (characterLitRest (x:rest)) && isLower x ->
+          | isSpace c && isNothing (characterLitRest (x:rest)) && isLetter x ->
               c:x:cleanupInputString rest
       c:rest
          | not (isSpace c) ->
@@ -396,7 +408,7 @@ fixPositionsTest =
              ,(IntLit, (loc, show line))
              ,(StringLit,(loc, fname))]
 
-analyze :: FilePath -> String -> ModuleInfo
+analyze :: FilePath -> String -> Either String ModuleInfo
 analyze originalFileName input =
     poorManAnalyzeTokens (fixPositions originalFileName (cleanupTokens (lexerPass0 (cleanupInputString input))))
 
@@ -469,21 +481,43 @@ analyzeTests =
 
 testAnalyze =
     do mapM_ runTest (zip [1..] analyzeTests)
+       let lexErrInput = "  ' "
+           lexErrRes = analyze "<input>" lexErrInput
+       case lexErrRes of
+         Left _ -> return ()
+         Right _ -> assertFailure ("Input " ++ show lexErrInput ++ " should lead to failure")
     where
       runTest (i, (src, mi)) =
-          let givenMi = analyze "<input>" src
-          in if givenMi == mi
-             then return ()
-             else assertFailure ("Error in test " ++ show i ++
-                                 ", expected:\n" ++ show mi ++
-                                 "\nGiven:\n" ++ show givenMi ++
-                                 "\nSrc:\n" ++ src)
+          do let res = analyze "<input>" src
+             case res of
+               Left err -> assertFailure ("Lexing should not fail: " ++ err)
+               Right givenMi ->
+                 if givenMi == mi
+                 then return ()
+                 else assertFailure ("Error in test " ++ show i ++
+                                     ", expected:\n" ++ show mi ++
+                                     "\nGiven:\n" ++ show givenMi ++
+                                     "\nSrc:\n" ++ src)
 
 transform :: Bool -> Bool -> FilePath -> String -> IO String
 transform hunitBackwardsCompat debug originalFileName input =
-    let info = analyze originalFileName fixedInput
-    in preprocess info
+    case analyze originalFileName fixedInput of
+      Left err ->
+          handleError err
+      Right info -> preprocess info
     where
+      handleError err =
+          do dir <- getTemporaryDirectory
+             (fp, handle) <- openTempFile dir "HTF-bug.hs"
+             hPutStr handle input
+             hClose handle
+             hPutStrLn stderr
+               (err ++
+                "\nCheck if your input file " ++ originalFileName ++ " is lexically correct.\n" ++
+                "If not, it's is a bug in htfpp.\nPlease report it at https://github.com/skogsbaer/HTF/issues.\n" ++
+                "The offending input has been saved to `" ++ fp ++ "'.\n" ++
+                "Attach it to your bug report.")
+             exitWith (ExitFailure 1)
       preprocess :: ModuleInfo -> IO String
       preprocess info =
           do when debug $ hPutStrLn stderr ("Module info:\n" ++ show info)
