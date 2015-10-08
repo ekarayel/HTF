@@ -319,9 +319,9 @@ passing a string argument to the @assert@-like functions, whereas HTF provides
 location information implicitly through its pre-processor @htfpp@.
 
 To simplify transition from HUnit to HTF, @htfpp@ provides a commandline flag
-@--hunit@. This flag causes @htfpp@ to exand the assertion macros in a way compatible
+@--hunit@. This flag causes @htfpp@ to expand the assertion macros in a way compatible
 with the types of the corresponding HUnit functions. For example, with the @--hunit@
-flag being present, @assertEqual@ is exanded to
+flag being present, @assertEqual@ is expanded to
 @'assertEqualVerbose_' ('makeLoc' \"filename\" line)@, whose type
 @(Show a, Eq a) => String -> a -> a -> IO ()@ is compatible with
 the type of HUnit's 'Test.HUnit.Base.assertEqual' function.
